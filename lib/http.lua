@@ -1,10 +1,11 @@
-local http_headers = require "resty.http_headers"
+local http_headers = require "http_headers"
 
-local ngx_socket_tcp = ngx.socket.tcp
-local ngx_req = ngx.req
-local ngx_req_socket = ngx_req.socket
-local ngx_req_get_headers = ngx_req.get_headers
-local ngx_req_get_method = ngx_req.get_method
+local socket = require "socket"
+local url = require "socket.url"
+local ssl = require "ssl"
+local tcp = socket.tcp
+
+local socket_tcp = tcp
 local str_gmatch = string.gmatch
 local str_lower = string.lower
 local str_upper = string.upper
@@ -13,18 +14,21 @@ local str_sub = string.sub
 local str_gsub = string.gsub
 local tbl_concat = table.concat
 local tbl_insert = table.insert
-local ngx_encode_args = ngx.encode_args
-local ngx_re_match = ngx.re.match
-local ngx_log = ngx.log
-local ngx_DEBUG = ngx.DEBUG
-local ngx_ERR = ngx.ERR
-local ngx_NOTICE = ngx.NOTICE
-local ngx_var = ngx.var
+local log = function(...)
+    print(...)
+end
 local co_yield = coroutine.yield
 local co_create = coroutine.create
 local co_status = coroutine.status
 local co_resume = coroutine.resume
 
+local encode_args = function(params)
+    local encoded = {}
+    for k, v in pairs(params) do
+        table.insert(encoded, url.escape(k) .. "=" .. url.escape(v))
+    end
+    return table.concat(encoded, "&")
+end
 
 -- http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.5.1
 local HOP_BY_HOP_HEADERS = {
@@ -87,7 +91,7 @@ local DEFAULT_PARAMS = {
 
 
 function _M.new(self)
-    local sock, err = ngx_socket_tcp()
+    local sock, err = socket_tcp()
     if not sock then
         return nil, err
     end
@@ -106,12 +110,18 @@ end
 
 
 function _M.ssl_handshake(self, ...)
+    self.sock = ssl.wrap(self.sock, {
+        mode = "client",
+        protocol = "tlsv1",
+        verify = "none",
+        options = "all",
+    })
     local sock = self.sock
     if not sock then
         return nil, "not initialized"
     end
 
-    return sock:sslhandshake(...)
+    return sock:dohandshake(...)
 end
 
 
@@ -179,25 +189,20 @@ end
 
 
 function _M.parse_uri(self, uri)
-    local m, err = ngx_re_match(uri, [[^(http[s]*)://([^:/]+)(?::(\d+))?(.*)]], 
-        "jo")
+    local protocol, host, port, path = string.find(uri, "(https?)://([^:/]+):?(%d*)(.*)")
 
-    if not m then
-        if err then
-            return nil, "failed to match the uri: " .. err
-        end
-
+    if not host or not protocol then
         return nil, "bad uri"
     else
-        if not m[3] then
-            if m[1] == "https" then
-                m[3] = 443
+        if not port then
+            if protocol == "https" then
+                port = 443
             else
-                m[3] = 80
+                port = 80
             end
         end
-        if not m[4] then m[4] = "/" end
-        return m, nil
+        if not path then path = "/" end
+        return {protocol, host, port, path}, nil
     end
 end
 
@@ -209,7 +214,7 @@ local function _format_request(params)
     local query = params.query or ""
     if query then
         if type(query) == "table" then
-            query = "?" .. ngx_encode_args(query)
+            query = "?" .. encode_args(query)
         end
     end
 
@@ -527,7 +532,6 @@ function _M.send_request(self, params)
 
     -- Format and send request
     local req = _format_request(params)
-    ngx_log(ngx_DEBUG, "\n", req)
     local bytes, err = sock:send(req)
 
     if not bytes then
@@ -663,7 +667,7 @@ function _M.request_pipeline(self, requests)
                     t.response_read = true
 
                     if not res then
-                        ngx_log(ngx_ERR, err)
+                        log(err)
                     else
                         for rk, rv in pairs(res) do
                             t[rk] = rv
@@ -719,81 +723,10 @@ function _M.request_uri(self, uri, params)
 
     local ok, err = self:set_keepalive()
     if not ok then
-        ngx_log(ngx_ERR, err)
+        log(err)
     end
 
     return res, nil
 end
-
-
-function _M.get_client_body_reader(self, chunksize)
-    local chunksize = chunksize or 65536
-    local ok, sock, err = pcall(ngx_req_socket)
-
-    if not ok then
-        return nil, sock -- pcall err
-    end
-
-    if not sock then
-        if err == "no body" then
-            return nil
-        else
-            return nil, err
-        end
-    end
-
-    local headers = ngx_req_get_headers()
-    local length = headers.content_length
-    local encoding = headers.transfer_encoding
-    if length then
-        return _body_reader(sock, tonumber(length), chunksize)
-    elseif encoding and str_lower(encoding) == 'chunked' then
-        -- Not yet supported by ngx_lua but should just work...
-        return _chunked_body_reader(sock, chunksize)
-    else
-       return nil
-    end
-end
-
-
-function _M.proxy_request(self, chunksize)
-    return self:request{
-        method = ngx_req_get_method(),
-        path = ngx_var.uri .. ngx_var.is_args .. (ngx_var.query_string or ""),
-        body = self:get_client_body_reader(chunksize),
-        headers = ngx_req_get_headers(),
-    }
-end
-
-
-function _M.proxy_response(self, response, chunksize)
-    if not response then
-        ngx_log(ngx_ERR, "no response provided")
-        return
-    end
-
-    ngx.status = response.status
-    
-    -- Filter out hop-by-hop headeres
-    for k,v in pairs(response.headers) do
-        if not HOP_BY_HOP_HEADERS[str_lower(k)] then
-            ngx.header[k] = v
-        end
-    end
-
-    local reader = response.body_reader
-    repeat
-        local chunk, err = reader(chunksize)
-        if err then
-            ngx_log(ngx_ERR, err)
-            break
-        end
-
-        if chunk then
-            ngx.print(chunk)
-        end
-    until not chunk
-end
-
 
 return _M
